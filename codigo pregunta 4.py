@@ -205,7 +205,7 @@ def analizar_nodos(G, pi_ref, pi_k, k):
     tamanos = 100 + 5000 * pi_ref
     colores = cambio_pos
 
-    plt.figure(figsize=(12, 9))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     nx.draw_networkx(
         G,
@@ -218,13 +218,20 @@ def analizar_nodos(G, pi_ref, pi_k, k):
         alpha=0.75
     )
 
-    plt.colorbar(
-        plt.cm.ScalarMappable(
-            cmap=plt.cm.coolwarm,
-            norm=plt.Normalize(vmin=0, vmax=max(1, cambio_pos.max()))
-        ),
-        label="Cambio de posición"
+    vmin = min(cambio_pos)
+    vmax = max(cambio_pos)
+
+    if vmin == vmax:
+        vmax = vmin + 1
+
+    sm = plt.cm.ScalarMappable(
+        cmap=plt.cm.coolwarm,
+        norm=plt.Normalize(vmin=vmin, vmax=vmax)
     )
+
+    sm.set_array([])
+
+    plt.colorbar(sm, ax=ax, label="Cambio en posición")
 
     plt.title(f"Análisis de nodos - SVD truncada k={k}")
     plt.savefig("inciso_e_grafo.png", dpi=300)
