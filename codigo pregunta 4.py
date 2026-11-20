@@ -1,5 +1,5 @@
-
 import os
+import csv
 import time
 import tracemalloc
 import random
@@ -9,20 +9,30 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import networkx as nx
+import matplotlib
+matplotlib.use("Agg")          # guarda las figuras sin abrir ventanas
 import matplotlib.pyplot as plt
-from scipy.stats import kendalltau
+from scipy.stats import kendalltau, rankdata
 
 # =============================================================================
 # CONFIGURACION
 # =============================================================================
-RUTA_STANFORD = os.path.join("datasets", "web-Stanford.txt")
+RUTA_STANFORD = os.path.join("datasets", "web-Stanford.txt")   # tambien acepta .txt.gz
 ALPHAS = [0.5, 0.85, 0.95, 0.99, 0.999]
 ALPHA_BASE = 0.85
 SEMILLAS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 TAMANOS = [100, 500, 1000, 2000, 5000]
 MAX_NODOS_STANFORD = 5000
+TAMANO_MAX_DENSO = 5000      # hasta que n se construyen S y M densas (inciso a)
+TAMANO_MAX_DENSO_F = 2000    # hasta que n se miden Pinv / SVD densa (inciso f); 5000 tarda varios minutos
+DEC_EMPATE = 9               # decimales para tratar como iguales los PageRank empatados
 DIRECTORIO_RESULTADOS = "resultados_control4"
 os.makedirs(DIRECTORIO_RESULTADOS, exist_ok=True)
+
+
+def ruta_resultado(nombre):
+    return os.path.join(DIRECTORIO_RESULTADOS, nombre)
+
 
 # =============================================================================
 # INCISO A: GENERACION DE GRAFOS Y CARGA DE STANFORD
@@ -36,11 +46,10 @@ def generar_grafo_sintetico(tipo, n, con_dangling=False, seed=42):
                                  seed=seed, directed=True)
     elif tipo == "BA":
         m = min(4, max(1, n - 1))
-        G0 = nx.barabasi_albert_graph(n, m, seed=seed)
+        base = nx.barabasi_albert_graph(n, m, seed=seed)
         G0 = nx.DiGraph()
         G0.add_nodes_from(range(n))
         # Orientacion aleatoria de cada arista no dirigida.
-        base = nx.barabasi_albert_graph(n, m, seed=seed)
         for u, v in base.edges():
             if rng.random() < 0.5:
                 G0.add_edge(u, v)
@@ -62,9 +71,12 @@ def generar_grafo_sintetico(tipo, n, con_dangling=False, seed=42):
 
 
 def cargar_stanford(ruta=RUTA_STANFORD):
-    if not os.path.exists(ruta):
+    candidatos = [ruta, ruta + ".gz"]
+    existentes = [r for r in candidatos if os.path.exists(r)]
+    if not existentes:
         print(f"[AVISO] No se encontro {ruta}. Se ejecutaran ER y BA; Stanford se omitira.")
         return None
+    ruta = existentes[0]
     print(f"Cargando Stanford desde: {ruta}")
     G = nx.read_edgelist(ruta, comments="#", create_using=nx.DiGraph(),
                          nodetype=int, data=False)
@@ -74,17 +86,32 @@ def cargar_stanford(ruta=RUTA_STANFORD):
 
 
 def crear_subgrafo_bfs(G, n, seed=42):
-    """Subgrafo inducido de la componente debil mayor; muestra local por BFS."""
+    """
+    Subgrafo inducido por los primeros n nodos de un BFS (sobre el grafo no
+    dirigido) que parte del nodo de mayor grado. Las etiquetas 0..n-1 siguen
+    el orden del BFS, de modo que cualquier prefijo range(m) es un subgrafo
+    conexo (cada nodo esta unido a su padre del BFS).
+    """
     n = min(n, G.number_of_nodes())
-    componente = max(nx.weakly_connected_components(G), key=len)
-    H = G.subgraph(componente)
-    inicio = max(H.degree, key=lambda par: par[1])[0]
-    arbol = nx.bfs_tree(H.to_undirected(), source=inicio)
-    seleccion = list(arbol.nodes())[:n]
-    if len(seleccion) < n:
-        usados = set(seleccion)
-        seleccion.extend([u for u in H.nodes() if u not in usados][:n-len(seleccion)])
-    return nx.convert_node_labels_to_integers(H.subgraph(seleccion).copy())
+    U = G.to_undirected(as_view=True)
+    inicio = max(G.degree, key=lambda par: par[1])[0]
+    orden = [inicio]
+    for _, v in nx.bfs_edges(U, inicio):
+        orden.append(v)
+        if len(orden) >= n:
+            break
+    if len(orden) < n:                       # por si la componente es menor que n
+        usados = set(orden)
+        orden.extend([u for u in G.nodes() if u not in usados][:n - len(orden)])
+    indice = {v: i for i, v in enumerate(orden)}
+    H = nx.DiGraph()
+    H.add_nodes_from(range(len(orden)))      # el orden de insercion fija el orden BFS
+    for u in orden:
+        iu = indice[u]
+        for v in G.successors(u):
+            if v in indice:
+                H.add_edge(iu, indice[v])
+    return H
 
 
 def construir_matrices(G, alpha=ALPHA_BASE, construir_densa=False):
@@ -145,21 +172,21 @@ def construir_conjunto_grafos(G_stanford):
                 G = generar_grafo_sintetico(tipo, n, con_dangling=con_d,
                                             seed=1000+n)
                 datos = construir_matrices(G, ALPHA_BASE,
-                                           construir_densa=(n <= 1000))
+                                           construir_densa=(n <= TAMANO_MAX_DENSO))
                 grafos[nombre] = (G, datos)
                 print(f"[OK] {nombre:18s} | Dangling: {np.sum(datos['D']):5d} "
                       f"| S_disp nnz: {datos['S'].nnz:10d}")
 
     if G_stanford is not None:
+        # Un solo BFS; cada tamano es un prefijo (conexo) del orden BFS.
         G_max = crear_subgrafo_bfs(G_stanford, MAX_NODOS_STANFORD)
         for n in TAMANOS:
             n_real = min(n, G_max.number_of_nodes())
             G = nx.convert_node_labels_to_integers(
                 G_max.subgraph(range(n_real)).copy())
             datos = construir_matrices(G, ALPHA_BASE,
-                                       construir_densa=(n_real <= 1000))
+                                       construir_densa=(n_real <= TAMANO_MAX_DENSO))
             grafos[f"Stanford_n{n_real}"] = (G, datos)
-            # Se conserva una linea de salida clara para cada tamano Stanford.
             print(f"[A] Stanford n={G.number_of_nodes():5d} | "
                   f"aristas={G.number_of_edges():7d} | "
                   f"dangling={np.sum(datos['D']):5d}")
@@ -176,14 +203,16 @@ def normalizar_l1(x):
     return x / norma
 
 
-def metodo_potencia(S_base, D, alpha=ALPHA_BASE, tol=1e-12, max_iter=200000):
+def metodo_potencia(S_base, D, alpha=ALPHA_BASE, tol=1e-12, max_iter=200000,
+                    devolver_iter=False):
     n = S_base.shape[0]
     pi = np.full(n, 1.0/n)
-    for _ in range(max_iter):
+    for it in range(1, max_iter + 1):
         masa_dangling = np.sum(pi[D]) / n
         nuevo = alpha * (S_base @ pi + masa_dangling) + (1-alpha)/n
         if np.linalg.norm(nuevo-pi, 1) < tol:
-            return normalizar_l1(nuevo)
+            res = normalizar_l1(nuevo)
+            return (res, it) if devolver_iter else res
         pi = nuevo
     raise RuntimeError("El metodo de potencia no convergio; aumenta max_iter.")
 
@@ -226,31 +255,51 @@ def metodo_svds_disperso(M_linop, k, alpha=ALPHA_BASE):
 # =============================================================================
 # METRICAS Y MEDICION
 # =============================================================================
+# Muchos nodos (aristas entrantes nulas, aislados) tienen exactamente el mismo
+# PageRank. Al comparar rankings se redondean los valores para que esos empates
+# cuenten como empates y no como diferencias de ruido numerico (~1e-16).
+def _redondear(x):
+    return np.round(np.asarray(x, dtype=float), DEC_EMPATE)
+
+
+def posiciones_ranking(pi):
+    """Posicion (0 = mejor) de cada nodo; los empates comparten la mejor posicion."""
+    return rankdata(-_redondear(pi), method="min").astype(int) - 1
+
+
 def precision_at_m(pi_ref, pi_aprox, m):
     m = min(int(m), len(pi_ref))
-    a = set(np.argsort(pi_ref)[::-1][:m])
-    b = set(np.argsort(pi_aprox)[::-1][:m])
+    a = set(np.argsort(-_redondear(pi_ref), kind="stable")[:m])
+    b = set(np.argsort(-_redondear(pi_aprox), kind="stable")[:m])
     return len(a & b) / m if m else np.nan
 
 
 def comparar_rankings(ref, aprox):
     error = np.linalg.norm(ref-aprox, 1)
-    tau, _ = kendalltau(ref, aprox)
+    tau, _ = kendalltau(_redondear(ref), _redondear(aprox))
     return float(error), float(tau)
 
 
+def ks_malla(n):
+    """Malla de k: valores bajos, medios y una cola fina cerca de n."""
+    base = [5, 10, 25, 50, 100, 150, 250, 400]
+    cola = [n-50, n-20, n-10, n-5, n-2, n-1, n]
+    return sorted({k for k in base + cola if 1 <= k <= n})
+
+
 def medir_tiempo_memoria(func, *args, repeticiones=5, **kwargs):
-    tiempos, picos = [], []
+    """Tiempo medio sin tracemalloc (no distorsiona) y pico de memoria en una pasada aparte."""
+    tiempos = []
     resultado = None
     for _ in range(repeticiones):
-        tracemalloc.start()
         t0 = time.perf_counter()
         resultado = func(*args, **kwargs)
         tiempos.append(time.perf_counter()-t0)
-        _, pico = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        picos.append(pico)
-    return resultado, float(np.mean(tiempos)), float(max(picos)/(1024**2))
+    tracemalloc.start()
+    func(*args, **kwargs)
+    _, pico = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return resultado, float(np.mean(tiempos)), float(pico/(1024**2))
 
 
 # =============================================================================
@@ -290,11 +339,21 @@ def inciso_c_espectro(grafos):
         kappa = s[0]/s[-1] if s[-1] > 0 else np.inf
         r1 = int(np.sum(s > 1e-2*s[0]))
         r2 = int(np.sum(s > 1e-4*s[0]))
-        resumen.append((alpha, s[-1], kappa, r1, r2))
+        _, iteraciones = metodo_potencia(d["S_base"], d["D"], alpha,
+                                         devolver_iter=True)
+        resumen.append((alpha, s[-1], kappa, r1, r2, iteraciones))
         espectros[alpha] = s
         print(f"alpha={alpha:5.3f} | sigma_min={s[-1]:.6e} "
               f"| kappa2={kappa:.6e} | rango(1e-2)={r1} | rango(1e-4)={r2}")
 
+    # Datos numericos (incluye iteraciones del metodo de la potencia).
+    with open(ruta_resultado("inciso_c_resumen.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["alpha", "sigma_min", "kappa_2", "rango_1e-2", "rango_1e-4",
+                    "iteraciones_potencia"])
+        w.writerows(resumen)
+
+    # Espectro completo.
     fig, ax = plt.subplots(figsize=(9, 6))
     for alpha, s in espectros.items():
         ax.semilogy(np.arange(1, len(s)+1), s, label=f"alpha={alpha}")
@@ -304,7 +363,21 @@ def inciso_c_espectro(grafos):
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(os.path.join(DIRECTORIO_RESULTADOS, "inciso_c_espectro.png"), dpi=220)
+    fig.savefig(ruta_resultado("inciso_c_espectro.png"), dpi=220)
+    plt.close(fig)
+
+    # Zoom en la cola: ahi es donde se separan los distintos alpha.
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for alpha, s in espectros.items():
+        idx = np.arange(len(s)-19, len(s)+1)
+        ax.semilogy(idx, s[-20:], marker="o", ms=3, label=f"alpha={alpha}")
+    ax.set_xlabel("Indice singular i (ultimos 20)")
+    ax.set_ylabel("Valor singular sigma_i (escala log)")
+    ax.set_title("Cola del espectro de M_alpha (BA, n=500, con dangling)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(ruta_resultado("inciso_c_espectro_cola.png"), dpi=220)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -315,7 +388,7 @@ def inciso_c_espectro(grafos):
     ax.set_title("Condicionamiento frente a alpha")
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(DIRECTORIO_RESULTADOS, "inciso_c_condicionamiento.png"), dpi=220)
+    fig.savefig(ruta_resultado("inciso_c_condicionamiento.png"), dpi=220)
     plt.close(fig)
     return resumen
 
@@ -330,16 +403,12 @@ def inciso_d_calidad(grafos):
                  "BA_n100_conD", "BA_n500_conD"]
     if "Stanford_n100" in grafos:
         conjuntos += ["Stanford_n100", "Stanford_n500"]
-    resultados = []
-    ks_por_n = {
-        100: [5, 10, 20, 40, 60, 80, 100],
-        500: [5, 10, 25, 50, 100, 150, 250, 400, 500]
-    }
+    filas = []
 
     for nombre in conjuntos:
         G, _ = grafos[nombre]
         n = len(G)
-        ks = ks_por_n[n]
+        ks = ks_malla(n)
         for alpha in ALPHAS:
             d = construir_matrices(G, alpha, construir_densa=True)
             ref = metodo_potencia(d["S_base"], d["D"], alpha)
@@ -354,7 +423,7 @@ def inciso_d_calidad(grafos):
                 p100 = precision_at_m(ref, aprox, 100)
                 print(f"k={k:3d} | L1={err:.6e} | tau={tau:.5f} "
                       f"| P@10={p10:.3f} | P@50={p50:.3f} | P@100={p100:.3f}")
-                resultados.append((nombre, n, alpha, k, err, tau, p10, p50, p100))
+                filas.append((nombre, "SVD truncada", n, alpha, k, err, tau, p10, p50, p100))
                 if k_min is None and np.isfinite(tau) and tau > 0.95:
                     k_min = k
             print(f"k minimo con Kendall tau > 0.95: {k_min}")
@@ -365,17 +434,22 @@ def inciso_d_calidad(grafos):
                     aprox_s = metodo_svds_disperso(d["M_linop"], k, alpha)
                     err_s, tau_s = comparar_rankings(ref, aprox_s)
                     print(f"SVD dispersa k={k:3d} | L1={err_s:.6e} | tau={tau_s:.5f}")
+                    filas.append((nombre, "SVD dispersa", n, alpha, k, err_s, tau_s,
+                                  precision_at_m(ref, aprox_s, 10),
+                                  precision_at_m(ref, aprox_s, 50),
+                                  precision_at_m(ref, aprox_s, 100)))
                 except (spla.ArpackNoConvergence, RuntimeError, ValueError) as exc:
                     print(f"[AVISO] SVD dispersa k={k} no convergio: {exc}")
 
     # CSV reproducible para analizar resultados fuera del programa.
-    salida = os.path.join(DIRECTORIO_RESULTADOS, "inciso_d_resultados.csv")
-    np.savetxt(salida, np.array([[r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]]
-                                 for r in resultados]),
-               delimiter=",", header="n,alpha,k,error_L1,kendall_tau,P10,P50,P100",
-               comments="")
+    salida = ruta_resultado("inciso_d_resultados.csv")
+    with open(salida, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["grafo", "metodo", "n", "alpha", "k", "error_L1",
+                    "kendall_tau", "P10", "P50", "P100"])
+        w.writerows(filas)
     print(f"Resultados numericos guardados en {salida}")
-    return resultados
+    return filas
 
 
 # =============================================================================
@@ -383,13 +457,14 @@ def inciso_d_calidad(grafos):
 # =============================================================================
 def analizar_nodos(G, datos, pi_ref, pi_aprox, k=10, etiqueta="grafo"):
     n = len(pi_ref)
-    rango_ref = np.argsort(np.argsort(-pi_ref))
-    rango_aprox = np.argsort(np.argsort(-pi_aprox))
+    # Posiciones con empates tratados como empates (ver posiciones_ranking).
+    rango_ref = posiciones_ranking(pi_ref)
+    rango_aprox = posiciones_ranking(pi_aprox)
     cambio_pos = np.abs(rango_ref-rango_aprox)
     cambio_pi = np.abs(pi_ref-pi_aprox)
 
     # Los ultimos vectores de V corresponden a los menores valores singulares.
-    U, s, Vt = calcular_svd(datos["M_densa"])
+    _, s, Vt = calcular_svd(datos["M_densa"])
     V_pequenos = Vt[-k:, :]
     participacion = np.sum(np.abs(V_pequenos), axis=0)
 
@@ -400,7 +475,7 @@ def analizar_nodos(G, datos, pi_ref, pi_aprox, k=10, etiqueta="grafo"):
 
     print("\n=== INCISO E: NODOS MAS AFECTADOS ===")
     print("Nodo | pi referencia | error abs | cambio ranking | in | out | participacion | betweenness | tipo")
-    afectados = np.argsort(cambio_pos)[::-1][:20]
+    afectados = np.argsort(-cambio_pos, kind="stable")[:20]
     for v in afectados:
         if salida[v] == 0:
             tipo = "dangling"
@@ -428,13 +503,13 @@ def analizar_nodos(G, datos, pi_ref, pi_aprox, k=10, etiqueta="grafo"):
     ax.set_title(f"{etiqueta}: tamano proporcional a PageRank; color = cambio de ranking")
     ax.axis("off")
     fig.tight_layout()
-    fig.savefig(os.path.join(DIRECTORIO_RESULTADOS, f"inciso_e_{etiqueta}.png"), dpi=220)
+    fig.savefig(ruta_resultado(f"inciso_e_{etiqueta}.png"), dpi=220)
     plt.close(fig)
 
     # Exportar tabla completa por nodo.
     tabla = np.column_stack((np.arange(n), pi_ref, pi_aprox, cambio_pi,
                              cambio_pos, entrada, salida, participacion, bet))
-    np.savetxt(os.path.join(DIRECTORIO_RESULTADOS, f"inciso_e_nodos_{etiqueta}.csv"),
+    np.savetxt(ruta_resultado(f"inciso_e_nodos_{etiqueta}.csv"),
                tabla, delimiter=",",
                header="nodo,PageRank_ref,PageRank_aprox,error_abs,cambio_ranking,grado_entrada,grado_salida,participacion_singular,betweenness",
                comments="")
@@ -477,7 +552,7 @@ def inciso_f_rendimiento(grafos):
             print(f"[AVISO] SVD dispersa n={n}: {exc}")
         tiempos["SVD dispersa"].append(t); memorias["SVD dispersa"].append(mem)
 
-        if n <= 500:
+        if n <= TAMANO_MAX_DENSO_F and d["M_densa"] is not None:
             # Pinv incluye la descomposicion/inversion densa.
             _, t, mem = medir_tiempo_memoria(metodo_pinv, d["M_densa"], ALPHA_BASE)
             tiempos["Pinv"].append(t); memorias["Pinv"].append(mem)
@@ -489,18 +564,28 @@ def inciso_f_rendimiento(grafos):
             tiempos["SVD truncada"].append(np.nan); memorias["SVD truncada"].append(np.nan)
         print(f"n={n:5d}: mediciones completadas")
 
+    # Datos numericos para el informe.
+    with open(ruta_resultado("inciso_f_datos.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["n"] + [f"tiempo_{m}" for m in metodos] + [f"memoria_MB_{m}" for m in metodos])
+        for i, n in enumerate(ns_validos):
+            w.writerow([n] + [tiempos[m][i] for m in metodos] + [memorias[m][i] for m in metodos])
+
+    estilos = {"Potencia": ("o", "-"), "Pinv": ("s", "--"),
+               "SVD truncada": ("^", "-"), "SVD dispersa": ("D", "-")}
     for titulo, datos_plot, ylabel, archivo in [
         ("Tiempo de ejecucion", tiempos, "Tiempo (s)", "inciso_f_tiempo.png"),
         ("Memoria medida", memorias, "Memoria (MB)", "inciso_f_memoria.png")
     ]:
         fig, ax = plt.subplots(figsize=(9, 6))
         for nombre, vals in datos_plot.items():
-            ax.plot(ns_validos, vals, marker="o", label=nombre)
+            marcador, linea = estilos[nombre]
+            ax.plot(ns_validos, vals, marker=marcador, linestyle=linea, label=nombre)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("Numero de nodos n"); ax.set_ylabel(ylabel)
         ax.set_title(titulo); ax.grid(True, which="both", alpha=0.3); ax.legend()
         fig.tight_layout()
-        fig.savefig(os.path.join(DIRECTORIO_RESULTADOS, archivo), dpi=220)
+        fig.savefig(ruta_resultado(archivo), dpi=220)
         plt.close(fig)
 
     print("\nPendientes empiricas en escala log-log (tiempo):")
@@ -542,7 +627,13 @@ def perturbar_grafo(G, porcentaje=0.01, seed=42):
 
 def inciso_g_robustez(grafos):
     print("\n=== INCISO G: ROBUSTEZ ANTE PERTURBACIONES DEL 1% ===")
-    nombre = "Stanford_n2000" if "Stanford_n2000" in grafos else "BA_n2000_conD"
+    if "Stanford_n2000" in grafos:
+        nombre = "Stanford_n2000"
+    elif "BA_n2000_conD" in grafos:
+        nombre = "BA_n2000_conD"
+    else:
+        nombre = max((k for k in grafos if k.endswith("conD")),
+                     key=lambda k: grafos[k][1]["n"])
     G, d = grafos[nombre]
     referencia = metodo_potencia(d["S_base"], d["D"], ALPHA_BASE)
     errores, taus = [], []
@@ -555,20 +646,52 @@ def inciso_g_robustez(grafos):
         print(f"Semilla={seed:3d} | error L1={err:.6e} | Kendall tau={tau:.6f}")
     print(f"Error L1: media={np.mean(errores):.6e}, desviacion={np.std(errores, ddof=1):.6e}")
     print(f"Tau:      media={np.mean(taus):.6f}, desviacion={np.std(taus, ddof=1):.6f}")
-    np.savetxt(os.path.join(DIRECTORIO_RESULTADOS, "inciso_g_robustez.csv"),
+    np.savetxt(ruta_resultado("inciso_g_robustez.csv"),
                np.column_stack((SEMILLAS, errores, taus)), delimiter=",",
                header="semilla,error_L1,kendall_tau", comments="")
+
+    # Repeticion del experimento del inciso d con 10 semillas (el grafo cambia
+    # con la semilla): k minimo con tau > 0.95 para alpha = ALPHA_BASE, n = 500.
+    print("\n--- INCISO G: k minimo (tau > 0.95) con 10 semillas, alpha=0.85, n=500 ---")
+    filas = []
+    for tipo in ("ER", "BA"):
+        kmins = []
+        for seed in SEMILLAS:
+            Gs = generar_grafo_sintetico(tipo, 500, con_dangling=True, seed=seed)
+            ds = construir_matrices(Gs, ALPHA_BASE, construir_densa=True)
+            ref = metodo_potencia(ds["S_base"], ds["D"], ALPHA_BASE)
+            cache = calcular_svd(ds["M_densa"])
+            k_min = None
+            for k in ks_malla(500):
+                aprox = metodo_svd_truncada(ds["M_densa"], k, ALPHA_BASE, cache)
+                _, tau = comparar_rankings(ref, aprox)
+                if np.isfinite(tau) and tau > 0.95:
+                    k_min = k
+                    break
+            kmins.append(k_min)
+            filas.append((tipo, seed, k_min))
+        validos = [k for k in kmins if k is not None]
+        if len(validos) >= 2:
+            print(f"{tipo}: k minimo por semilla={kmins} | media={np.mean(validos):.1f} "
+                  f"| desviacion={np.std(validos, ddof=1):.1f}")
+        else:
+            print(f"{tipo}: k minimo por semilla={kmins}")
+    with open(ruta_resultado("inciso_g_kmin.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["tipo", "semilla", "k_min"])
+        w.writerows(filas)
+
 
 # =============================================================================
 # PROGRAMA PRINCIPAL
 # =============================================================================
-if __name__ == "__main__":
+def main():
     G_stanford = cargar_stanford()
     grafos = construir_conjunto_grafos(G_stanford)
 
     inciso_b_validacion(grafos)
-    resumen_c = inciso_c_espectro(grafos)
-    resultados_d = inciso_d_calidad(grafos)
+    inciso_c_espectro(grafos)
+    inciso_d_calidad(grafos)
 
     print("\n=== INCISO E: ANALISIS POR NODO ===")
     nombre_e = "Stanford_n500" if "Stanford_n500" in grafos else "BA_n500_conD"
@@ -582,3 +705,7 @@ if __name__ == "__main__":
     inciso_g_robustez(grafos)
 
     print(f"\nEjecucion terminada. Resultados guardados en: {DIRECTORIO_RESULTADOS}/")
+
+
+if __name__ == "__main__":
+    main()
